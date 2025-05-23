@@ -1,0 +1,4 @@
+dataset/handwriting-recognition/
+dataset/iam_data/
+**/__pycache__/
+*.pyc

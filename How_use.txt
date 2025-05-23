@@ -1,0 +1,4 @@
+To use the model you have to run it on terminal
+python -m dataset.dataset_loader
+python -m models.CRNN_Model
+python -m models.Evaluate_model
