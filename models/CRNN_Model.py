@@ -8,6 +8,7 @@ from tensorflow.keras.layers import (
 )
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.applications import DenseNet121
+
 from dataset.dataset_loader import load_csv, load_data, num_of_characters, max_str_len
 
 def ctc_lambda_func(args):
@@ -15,43 +16,33 @@ def ctc_lambda_func(args):
     return K.ctc_batch_cost(labels, y_pred, input_length, label_length)
 
 def build_crnn(input_shape):
-    inp = Input(shape=input_shape, name='input')        # (H, W, 1)
-    x = Concatenate(axis=-1)([inp, inp, inp])          # (H, W, 3)
-
-    # DenseNet121 백본
+    inp = Input(shape=input_shape, name='input')                 # (H, W, 1)
+    x = Concatenate(axis=-1)([inp, inp, inp])                    # (H, W, 3)
     densenet = DenseNet121(
         include_top=False,
         weights='imagenet',
         input_tensor=x
     )
-
-    x = densenet.output                               # (batch, H', W', C)
-    x = Permute((2, 1, 3))(x)                         # (batch, W', H', C)
+    x = densenet.output                                         # (batch, H', W', C)
+    x = Permute((2, 1, 3))(x)                                   # (batch, W', H', C)
     static = x.shape
-    x = Reshape((static[1], static[2] * static[3]))(x)  # (batch, W', H'*C)
-
-    # FC + BiLSTM 블록
+    x = Reshape((static[1], static[2] * static[3]))(x)          # (batch, W', H'*C)
     x = Dense(64, activation='relu', kernel_initializer='he_normal')(x)
     x = Bidirectional(LSTM(256, return_sequences=True))(x)
     x = Bidirectional(LSTM(256, return_sequences=True))(x)
-
-    # 문자 클래스 예측
     x = Dense(num_of_characters, kernel_initializer='he_normal')(x)
     y_pred = Activation('softmax', name='softmax')(x)
-
     return Model(inputs=inp, outputs=y_pred, name='DenseNet_CRNN')
 
 def build_train_model(base_model):
     labels = Input(name='labels', shape=[max_str_len], dtype='int32')
     input_length = Input(name='input_length', shape=[1], dtype='int32')
     label_length = Input(name='label_length', shape=[1], dtype='int32')
-
     ctc_loss = Lambda(
         ctc_lambda_func,
         output_shape=(1,),
         name='ctc'
     )([base_model.output, labels, input_length, label_length])
-
     return Model(
         inputs=[base_model.input, labels, input_length, label_length],
         outputs=ctc_loss
@@ -67,8 +58,12 @@ def train():
     # 데이터 로드
     train_df = load_csv(train_csv)
     valid_df = load_csv(valid_csv)
-    train_x, train_y, train_input_len, train_label_len = load_data(train_df, train_dir, size=30000)
-    valid_x, valid_y, valid_input_len, valid_label_len = load_data(valid_df, valid_dir, size=3000)
+    train_x, train_y, train_input_len, train_label_len = load_data(
+        train_df, train_dir, size=30000
+    )
+    valid_x, valid_y, valid_input_len, valid_label_len = load_data(
+        valid_df, valid_dir, size=3000
+    )
 
     # 모델 준비
     base_model = build_crnn(input_shape=(256, 64, 1))
