@@ -1,71 +1,129 @@
-import os
+# Evaluation.py
 import numpy as np
-from keras import backend as K
-from keras.models import load_model
-from dataset.dataset_loader import (
-    load_csv, load_data,
-    num_of_characters, max_str_len, num_to_label, alphabets
-)
-from models.CRNN_Model import build_crnn
+import cv2
+import editdistance
+from tensorflow.keras.models import load_model
+from dataset.dataset_loader import load_csv, DataGenerator, num_to_label
+import tensorflow.keras.backend as K
 
-def levenshtein(s1, s2):
-    m, n = len(s1), len(s2)
-    dp = [[0]*(n+1) for _ in range(m+1)]
-    for i in range(m+1):
-        dp[i][0] = i
-    for j in range(n+1):
-        dp[0][j] = j
-    for i in range(1, m+1):
-        for j in range(1, n+1):
-            cost = 0 if s1[i-1] == s2[j-1] else 1
-            dp[i][j] = min(dp[i-1][j] + 1,
-                           dp[i][j-1] + 1,
-                           dp[i-1][j-1] + cost)
-    return dp[m][n]
+def ctc_decode_predictions(y_pred, input_length):
+    """CTC 디코딩을 통한 예측 결과 변환"""
+    # Greedy 디코딩
+    decoded = K.ctc_decode(y_pred, input_length, greedy=True)[0][0]
+    return K.eval(decoded)
 
-def decode_predictions(model, X):
-    preds = model.predict(X)  # shape: (batch, timesteps, num_chars)
-    input_len = np.ones(preds.shape[0]) * preds.shape[1]
-    # greedy CTC 디코딩
-    decoded, _ = K.ctc_decode(preds, input_length=input_len, greedy=True)
-    decoded = K.get_value(decoded[0])
-    texts = []
-    for seq in decoded:
-        # -1 인덱스(CTC blank) 및 반복 제거
-        chars = [alphabets[idx] for idx in seq if idx >= 0]
-        texts.append(''.join(chars))
-    return texts
+def calculate_accuracy(y_true_labels, y_pred_labels):
+    """문자열 정확도 계산"""
+    correct = 0
+    total = len(y_true_labels)
+    
+    for true_label, pred_label in zip(y_true_labels, y_pred_labels):
+        if true_label == pred_label:
+            correct += 1
+    
+    return correct / total
 
-def evaluate(model, df, img_dir, size):
-    # 데이터 로드
-    X, Y, _, _ = load_data(df, img_dir, size)
-    # 실제 문자열 목록
-    gt_texts = [num_to_label(seq) for seq in Y]
-    # 예측
-    pred_texts = decode_predictions(model, X)
-    # 지표 계산
-    seq_acc = np.mean([g == p for g, p in zip(gt_texts, pred_texts)])
-    cer_scores = [levenshtein(g, p)/max(len(g), 1)
-                  for g, p in zip(gt_texts, pred_texts)]
-    print(f"Sequence Accuracy: {seq_acc:.4f}")
-    print(f"Mean CER: {np.mean(cer_scores):.4f}")
-    # 샘플 출력
-    for i in range(min(10, size)):
-        print(f"GT: {gt_texts[i]}  |  Pred: {pred_texts[i]}")
+def calculate_edit_distance(y_true_labels, y_pred_labels):
+    """편집 거리 기반 유사도 계산"""
+    total_distance = 0
+    total_length = 0
+    
+    for true_label, pred_label in zip(y_true_labels, y_pred_labels):
+        distance = editdistance.eval(true_label, pred_label)
+        total_distance += distance
+        total_length += max(len(true_label), len(pred_label))
+    
+    # 정규화된 편집 거리 (0에 가까울수록 좋음)
+    normalized_distance = total_distance / total_length if total_length > 0 else 0
+    similarity = 1 - normalized_distance
+    
+    return similarity
 
-if __name__ == "__main__":
-    # 설정
-    ROOT = os.path.dirname(__file__)
-    # 검증 CSV 및 디렉터리 경로
-    valid_csv = os.path.join(
-        ROOT, "dataset/handwriting-recognition/written_name_validation_v2.csv"
+def evaluate_model(model_path, test_csv, test_dir):
+    """모델 평가 메인 함수"""
+    
+    # 1. 모델 로드
+    print("모델 로딩 중...")
+    model = load_model(model_path)
+    
+    # 2. 테스트 데이터 로드
+    print("테스트 데이터 로딩 중...")
+    test_df = load_csv(test_csv)
+    test_gen = DataGenerator(
+        test_df,
+        test_dir,
+        batch_size=32,
+        target_h=64,
+        max_w=256
     )
-    valid_dir = os.path.join(
-        ROOT, "dataset/handwriting-recognition/validation_v2/validation"
-    )
-    # 모델 빌드 및 가중치 로드
-    base_model = build_crnn(input_shape=(256, 64, 1))
-    base_model.load_weights("best_resnet_crnn.h5")
+    
+    # 3. 예측 수행
+    print("예측 수행 중...")
+    y_true_labels = []
+    y_pred_labels = []
+    
+    for i in range(len(test_gen)):
+        batch_data, _ = test_gen[i]
+        batch_images = batch_data[0]
+        batch_true_labels = batch_data[1]
+        batch_input_lengths = batch_data[2]
+        
+        # 모델 예측
+        predictions = model.predict(batch_images)
+        
+        # CTC 디코딩
+        decoded_preds = ctc_decode_predictions(predictions, batch_input_lengths)
+        
+        # 결과 변환
+        for j, (true_label, pred_indices) in enumerate(zip(batch_true_labels, decoded_preds)):
+            # True label 변환
+            true_text = num_to_label(true_label[true_label >= 0])
+            
+            # Predicted label 변환
+            pred_text = num_to_label(pred_indices[pred_indices >= 0])
+            
+            y_true_labels.append(true_text)
+            y_pred_labels.append(pred_text)
+            
+            # 진행 상황 출력 (처음 10개만)
+            if len(y_true_labels) <= 10:
+                print(f"Sample {len(y_true_labels)}: True='{true_text}', Pred='{pred_text}'")
+    
+    # 4. 평가 지표 계산
+    print("\n=== 평가 결과 ===")
+    
+    # 정확도
+    accuracy = calculate_accuracy(y_true_labels, y_pred_labels)
+    print(f"정확도 (Exact Match): {accuracy:.4f} ({accuracy*100:.2f}%)")
+    
+    # 편집 거리 기반 유사도
+    similarity = calculate_edit_distance(y_true_labels, y_pred_labels)
+    print(f"편집 거리 유사도: {similarity:.4f} ({similarity*100:.2f}%)")
+    
+    # 5. 상세 분석
+    print(f"\n총 테스트 샘플 수: {len(y_true_labels)}")
+    
+    # 길이별 정확도
+    length_accuracies = {}
+    for true_label, pred_label in zip(y_true_labels, y_pred_labels):
+        length = len(true_label)
+        if length not in length_accuracies:
+            length_accuracies[length] = {'correct': 0, 'total': 0}
+        
+        length_accuracies[length]['total'] += 1
+        if true_label == pred_label:
+            length_accuracies[length]['correct'] += 1
+    
+    print("\n길이별 정확도:")
+    for length in sorted(length_accuracies.keys()):
+        stats = length_accuracies[length]
+        acc = stats['correct'] / stats['total']
+        print(f"  길이 {length}: {acc:.4f} ({stats['correct']}/{stats['total']})")
+
+if __name__ == '__main__':
     # 평가 실행
-    df_valid = load_csv(valid_csv)
-    evaluate(base_model, df_valid, valid_dir, size=len(df_valid))
+    model_path = 'best_densenet_crnn.h5'  # 학습된 모델 경로
+    test_csv = 'dataset/handwriting-recognition/written_name_test_v2.csv'
+    test_dir = 'dataset/handwriting-recognition/test_v2/test'
+    
+    evaluate_model(model_path, test_csv, test_dir)
