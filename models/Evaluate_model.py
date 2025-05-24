@@ -1,50 +1,42 @@
-# Evaluation.py
+# Evaluation.py (수정 버전)
 import numpy as np
 import cv2
 import editdistance
+import tensorflow as tf
 from tensorflow.keras.models import load_model
 from dataset.dataset_loader import load_csv, DataGenerator, num_to_label
-import tensorflow.keras.backend as K
+from models.CRNN_Model import ctc_lambda_func  # Custom loss import
 
 def ctc_decode_predictions(y_pred, input_length):
-    """CTC 디코딩을 통한 예측 결과 변환"""
-    # Greedy 디코딩
-    decoded = K.ctc_decode(y_pred, input_length, greedy=True)[0][0]
-    return K.eval(decoded)
-
-def calculate_accuracy(y_true_labels, y_pred_labels):
-    """문자열 정확도 계산"""
-    correct = 0
-    total = len(y_true_labels)
+    """TensorFlow 2.x 호환 CTC 디코딩"""
+    # Tensor를 numpy로 변환
+    if isinstance(input_length, tf.Tensor):
+        input_length = input_length.numpy()
     
-    for true_label, pred_label in zip(y_true_labels, y_pred_labels):
-        if true_label == pred_label:
-            correct += 1
+    # CTC 디코딩 (TensorFlow 2.x 방식)
+    decoded_dense, _ = tf.nn.ctc_greedy_decoder(
+        inputs=tf.transpose(y_pred, [1, 0, 2]),  # (time, batch, classes)
+        sequence_length=input_length.flatten()
+    )
     
-    return correct / total
-
-def calculate_edit_distance(y_true_labels, y_pred_labels):
-    """편집 거리 기반 유사도 계산"""
-    total_distance = 0
-    total_length = 0
-    
-    for true_label, pred_label in zip(y_true_labels, y_pred_labels):
-        distance = editdistance.eval(true_label, pred_label)
-        total_distance += distance
-        total_length += max(len(true_label), len(pred_label))
-    
-    # 정규화된 편집 거리 (0에 가까울수록 좋음)
-    normalized_distance = total_distance / total_length if total_length > 0 else 0
-    similarity = 1 - normalized_distance
-    
-    return similarity
+    # SparseTensor를 dense로 변환
+    decoded_dense = tf.sparse.to_dense(decoded_dense[0], default_value=-1)
+    return decoded_dense.numpy()
 
 def evaluate_model(model_path, test_csv, test_dir):
-    """모델 평가 메인 함수"""
+    """모델 평가 메인 함수 (수정 버전)"""
     
-    # 1. 모델 로드
+    # 1. 모델 로드 (Custom objects 포함)
     print("모델 로딩 중...")
-    model = load_model(model_path)
+    try:
+        # Base model 로드 시도
+        model = load_model(model_path)
+    except:
+        # Custom CTC loss가 포함된 경우
+        model = load_model(model_path, custom_objects={'ctc_lambda_func': ctc_lambda_func})
+    
+    print(f"모델 입력 shape: {model.input_shape}")
+    print(f"모델 출력 shape: {model.output_shape}")
     
     # 2. 테스트 데이터 로드
     print("테스트 데이터 로딩 중...")
@@ -68,19 +60,24 @@ def evaluate_model(model_path, test_csv, test_dir):
         batch_true_labels = batch_data[1]
         batch_input_lengths = batch_data[2]
         
-        # 모델 예측
-        predictions = model.predict(batch_images)
+        # 모델 예측 (base model만 사용)
+        predictions = model.predict(batch_images, verbose=0)
         
-        # CTC 디코딩
+        # CTC 디코딩 (수정된 방식)
         decoded_preds = ctc_decode_predictions(predictions, batch_input_lengths)
         
         # 결과 변환
-        for j, (true_label, pred_indices) in enumerate(zip(batch_true_labels, decoded_preds)):
+        for j in range(len(batch_true_labels)):
             # True label 변환
+            true_label = batch_true_labels[j]
             true_text = num_to_label(true_label[true_label >= 0])
             
             # Predicted label 변환
-            pred_text = num_to_label(pred_indices[pred_indices >= 0])
+            if j < len(decoded_preds):
+                pred_indices = decoded_preds[j]
+                pred_text = num_to_label(pred_indices[pred_indices >= 0])
+            else:
+                pred_text = ""
             
             y_true_labels.append(true_text)
             y_pred_labels.append(pred_text)
@@ -93,36 +90,27 @@ def evaluate_model(model_path, test_csv, test_dir):
     print("\n=== 평가 결과 ===")
     
     # 정확도
-    accuracy = calculate_accuracy(y_true_labels, y_pred_labels)
+    correct = sum(1 for true, pred in zip(y_true_labels, y_pred_labels) if true == pred)
+    accuracy = correct / len(y_true_labels)
     print(f"정확도 (Exact Match): {accuracy:.4f} ({accuracy*100:.2f}%)")
     
     # 편집 거리 기반 유사도
-    similarity = calculate_edit_distance(y_true_labels, y_pred_labels)
+    total_distance = 0
+    total_length = 0
+    for true_label, pred_label in zip(y_true_labels, y_pred_labels):
+        distance = editdistance.eval(true_label, pred_label)
+        total_distance += distance
+        total_length += max(len(true_label), len(pred_label))
+    
+    similarity = 1 - (total_distance / total_length) if total_length > 0 else 0
     print(f"편집 거리 유사도: {similarity:.4f} ({similarity*100:.2f}%)")
     
-    # 5. 상세 분석
     print(f"\n총 테스트 샘플 수: {len(y_true_labels)}")
-    
-    # 길이별 정확도
-    length_accuracies = {}
-    for true_label, pred_label in zip(y_true_labels, y_pred_labels):
-        length = len(true_label)
-        if length not in length_accuracies:
-            length_accuracies[length] = {'correct': 0, 'total': 0}
-        
-        length_accuracies[length]['total'] += 1
-        if true_label == pred_label:
-            length_accuracies[length]['correct'] += 1
-    
-    print("\n길이별 정확도:")
-    for length in sorted(length_accuracies.keys()):
-        stats = length_accuracies[length]
-        acc = stats['correct'] / stats['total']
-        print(f"  길이 {length}: {acc:.4f} ({stats['correct']}/{stats['total']})")
+    return accuracy, similarity
 
 if __name__ == '__main__':
-    # 평가 실행
-    model_path = 'best_densenet_crnn.h5'  # 학습된 모델 경로
+    # 평가 실행 - base model 경로로 수정
+    model_path = 'final_densenet_crnn_rtx3070.h5'  # base model 사용
     test_csv = 'dataset/handwriting-recognition/written_name_test_v2.csv'
     test_dir = 'dataset/handwriting-recognition/test_v2/test'
     
