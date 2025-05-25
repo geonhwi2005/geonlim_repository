@@ -2,3 +2,5 @@ dataset/handwriting-recognition/
 dataset/iam_data/
 **/__pycache__/
 *.pyc
+best_densenet_crnn.h5
+best_model.h5
