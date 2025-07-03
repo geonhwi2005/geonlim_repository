@@ -4,3 +4,5 @@ dataset/iam_data/
 *.pyc
 best_densenet_crnn.h5
 best_model.h5
+dataset/iam_data.zip
+dataset/*.zip
